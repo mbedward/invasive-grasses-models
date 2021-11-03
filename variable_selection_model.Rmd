@@ -1,0 +1,607 @@
+---
+title: "Variable selection model for risk score components"
+author:
+  - Julia Rayment <jrayment@uow.edu.au>
+  - Michael Bedward <mbedward@uow.edu.au>
+output: 
+  word_document: 
+    fig_width: 8
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr, warn.conflicts = FALSE)
+library(janitor)
+library(stringr)
+library(readxl)
+library(tidyr)
+
+
+library(ggplot2)
+theme_set( theme_bw() )
+
+library(ggrepel)
+library(patchwork)
+
+library(runjags)
+library(bayesplot)
+
+# Package used to help calculate log-likelihood and
+# deviance values for the fitted model
+library(extraDistr)
+
+runjags.options(method = "parallel", modules = "glm")
+
+# Set the pseudo-random number generator seed value
+# for reproducible results between sessions
+set.seed(42)
+
+```
+
+
+## Summary
+
+The Beta-Binomial model for species occurrence versus summed risk score, based on ten component measures, found a weak positive relationship with substantial variability around the fitted mean trend.
+
+Here we use a simple Bayesian variable selection model to identify a subset of component measures and any evidence that some might have a negative rather than positive marginal effect on species occupancy. Using this subset of measures, we re-fit the Beta-Binomial model to see whether a tighter relationship between site occupancy and risk score can be achieved.
+
+
+## Data
+
+Total number of sites surveyed, including those with no EPGs detected.
+
+```{r}
+
+TotalSites <- 139
+
+```
+
+
+The risk assessment data are in an Excel file `EPG FINAL RANKING 2021.xlsx`. 
+
+```{r}
+
+DAT_EPG <- readxl::read_excel("EPG FINAL RANKING 2021.xlsx", sheet = 1, range = "B2:N31") %>%
+  
+  # standardize the column names for R
+  janitor::clean_names() %>%
+  
+  # rename the summed risk score column
+  rename(summed_risk = total_32)
+
+```
+
+
+The summary species occurrence data are in an CSV-format file `epg_overall_occurrence.csv`
+
+```{r}
+
+DAT_occurrence <- read.csv("epg_overall_occurrence.csv")
+
+# Calculate proportion of sites with presence
+DAT_occurrence <- DAT_occurrence %>%
+  mutate(psites = nsites / TotalSites)
+
+```
+
+
+Add risk score components for each species and remove those without scores.
+
+```{r}
+
+DAT <- DAT_occurrence %>%
+  # Match on name, or just genus for Sporobolus
+  mutate(match_name = ifelse(str_detect(species_name, "Sporobolus"), "Sporobolus", species_name)) %>%
+  
+  left_join(DAT_EPG %>% select(species_name, trade_off_species:future_distribution, summed_risk), 
+            by = c("match_name" = "species_name")) %>%
+  
+  # Discard any species that did not have a match
+  filter(!is.na(summed_risk)) %>%
+  select(-summed_risk)
+  
+  # Convert all risk components to ordered factors
+  # mutate(across(trade_off_species:future_distribution, factor, ordered=TRUE))
+
+
+head(DAT)
+
+```
+
+
+## Variable selection model
+
+The model is similar to a LASSO regression in that model fitting and variable selection is done simultaneously. In LASSO regression, the coefficient values for less informative predictors are squeezed towards zero. Those predictors with zero coefficients are effectively dropped from the model. The model here accomplishes something similar, but uses a switch for each predictor in the form of a binary indicator variable. At each iteration of the MCMC process, only those predictors with indicators equal to one contribute to the model. The mean value of a predictor's indicator variable over all MCMC iterations gives the proportion of times that the predictor was included in the model, and can be taken as a measure of variable importance.
+
+At each MCMC iteration, the indicator value $\psi_i$ for the predictor $i$ is set to 0 or 1 as follows:
+
+$$ \psi_i \sim \text{Bernoulli}(p_i) $$
+$$ p_i \sim \text{Beta}(0.5, 0.5) $$
+
+The Beta(0.5, 0.5) distribution has a concave shape which is intended to make it a little easier for the model to switch between indicator values. However, test runs with a Beta(1, 1) prior distribution produced almost identical results for predictor inclusion rates.
+
+**Note:** At this stage the original weights of the individual risk components are being retained as predictor values. Later, we might investigate treating the components as ordinal categorical variables and having the model learn weights for the levels of each variable.
+
+### JAGS mode code
+
+```{r}
+
+ind_model_code <- "model {
+  for (i in 1:length(nsites)) {
+    nsites[i] ~ dbin(p_occ[i], TotalSites)
+    
+    # logit probability based on the risk components that are
+    # being included at this iteration
+    logit(p_occ[i]) <- b0 + inprod(b1[] * psi[], X[i, ])
+  }
+  
+  # Risk component inclusion
+  for (i in 1:Ncomponents) {
+    # Indicator (0/1) flag for inclusion
+    psi[i] ~ dbern(p_ind[i])
+    
+    # Prior for probability of inclusion
+    p_ind[i] ~ dbeta(0.5, 0.5)
+  }
+  
+  # Priors for regression coefficients
+  b0 ~ dnorm(0, sd0^(-2))
+
+  for (i in 1:Ncomponents) {
+    b1[i] ~ dnorm(0, sd_b^(-2))
+  }
+  
+  sd0 ~ dexp(1)
+  sd_b ~ dexp(1)
+}"
+
+```
+
+
+### Fit the model
+
+```{r}
+
+X <- DAT %>%
+  select(trade_off_species:future_distribution) %>%
+  as.matrix()
+  
+
+ind_model <- run.jags(ind_model_code, 
+                      data = list(TotalSites = TotalSites, 
+                                  nsites = DAT$nsites, 
+                                  X = X, 
+                                  Ncomponents = ncol(X)), 
+                      monitor = c("b0", "b1", "psi", "sd0", "sd_b"), 
+                      n.chains = 4, 
+                      sample = 2000, 
+                      thin = 20)
+
+```
+
+Check model summary for proper convergence.
+
+```{r}
+
+summary(ind_model)
+
+```
+
+All parameters have a good number of effective independent samples (SSeff) and values of the Gelman-Rubin statistic (psrf) close to 1.0, indicating that the MCMC process has converged well.
+
+About half of the risk components have high inclusion rates (mean `psi` value).
+
+
+Retrieve the posterior samples for model parameters.
+
+```{r}
+
+ind_model_samples <- as.matrix(ind_model$mcmc)
+
+```
+
+
+### Model results
+
+For each risk component, we plot the distribution of marginal parameter values for MCMC iterations where the component was included, and annotate with the model inclusion rate.
+
+```{r}
+
+gglist <- lapply(2:11, function(i) {
+  ii <- ind_model_samples[,10+i] == 1
+  
+  dat.gg <- data.frame(b = ind_model_samples[ii, i])
+  
+  title <- paste0(colnames(X)[i-1], "\n", round(100*mean(ii), 2), "% inclusion")
+  
+  ggplot(data = dat.gg) +
+    geom_density(aes(x = b)) +
+    
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    scale_x_continuous(limits = c(-1, 1)) +
+    
+    labs(x = "Marginal effect", y = "Density", title = title) +
+    
+    theme(plot.title = element_text(size = 11),
+          panel.grid = element_blank())
+})
+
+```
+
+
+
+```{r}
+
+patchwork::wrap_plots(gglist[1:5], nrow=2)
+
+patchwork::wrap_plots(gglist[6:10], nrow=2)
+
+```
+
+Bundle all graphs together for exported image.
+
+```{r}
+
+ggsave(plot = patchwork::wrap_plots(gglist), 
+       filename = "variable_selection_marginal_effects.png", 
+       width = 24, height = 18, units = "cm")
+
+```
+
+
+Of the five risk components that were included at least 80% of the time, the model saw three as having a positive influence on species occurrence (trade-off species, long-term seed viability, allelopathy) while two were seen as having a negative influence (resource competition, changes to ecosystem).
+
+
+## Summed risk score based on subset of components
+
+Here we calculate a new summed risk score based on the five risk components with high model inclusion rates (above), with the weightings for the two components that had a negative effect set to be negative values.
+
+```{r}
+
+DAT_subset <- DAT %>%
+  select(species_name, nsites, 
+         trade_off_species, long_term_seed_viability, allelopathy,
+         resource_competition, changes_to_ecosystem) %>%
+  
+  mutate(resource_competition = -resource_competition,
+         changes_to_ecosystem = -changes_to_ecosystem)
+
+DAT_subset$summed_risk_subset <- rowSums(DAT_subset[, -c(1,2)])  
+
+```
+
+
+Graph of the relationship between site occupancy and the subset risk score. An indicative trend line is added to get an initial idea of the degree of over-dispersion.
+
+```{r}
+
+ggplot(data = DAT_subset, aes(x = summed_risk_subset, y = nsites)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y~poly(x, 3))
+
+```
+
+## Re-fit the Beta-Binomial model using the reduced summed risk score
+
+We refit the model with summed risk based on the risk components identified by the variable selection model, and compare the values for over-dispersion and proportion of deviance explained to the original model.
+
+### JAGS model code 
+
+```{r}
+
+beta_binom_code <- "model {
+  # For each data record...
+  for (i in 1:length(nsites)) {
+    # The number of sites where the species occurs is treated as
+    # a binomial variable
+    #
+    nsites[i] ~ dbin(p[i], TotalSites)
+    
+    # The species probability of occurrence is drawn from a Beta
+    # distribution with parameters related to a mean probability
+    # value and a scale factor for over-dispersion
+    #
+    p[i] ~ dbeta(a[i], b[i])
+    a[i] <- pmean[i] * phi
+    b[i] <- (1 - pmean[i]) * phi
+    
+    # The mean probability is related to (centred) risk score
+    #
+    logit(pmean[i]) <- b0 + b1*summed_risk_c[i]
+  }
+
+  # Prior distributions for the regression parameters
+  # Note: that JAGS parameterizes a Normal distribution by precision 
+  # (1 / variance) rather than standard deviation.
+  b0 ~ dnorm(0, 0.01)
+  b1 ~ dnorm(0, 0.01)
+
+  # Prior distribution for the phi scale parameter
+  phi ~ dexp(1/10)
+}"
+
+```
+
+
+### Fit the model
+
+We centre the risk score values to improve MCMC convergence.
+
+```{r}
+
+DAT_subset <- DAT_subset %>%
+  mutate(summed_risk_c = summed_risk_subset - mean(summed_risk_subset))
+
+beta_binom_model_sub <- run.jags(beta_binom_code, 
+                                 data = list(
+                                   nsites = DAT_subset$nsites,
+                                   summed_risk_c = DAT_subset$summed_risk_c,
+                                   TotalSites = TotalSites
+                                 ),
+                                 monitor = c("b0", "b1", "phi"), 
+                                 n.chains = 4,
+                                 burnin = 10000,
+                                 sample = 2000,
+                                 thin = 5)
+
+```
+
+```{r}
+
+summary(beta_binom_model_sub)
+
+```
+
+The summary values indicate that the model has converged well. The mean value of the `phi` scale parameter for over-dispersion is substantially higher than the corresponding value from the original model, indicating less variability around the fitted trend.
+
+
+### Posterior samples from the fitted model
+
+```{r}
+
+beta_binom_sub_samples <- as.matrix(beta_binom_model_sub$mcmc)
+
+cat("Posterior samples matrix has", nrow(beta_binom_sub_samples), "rows\n\n")
+
+head(beta_binom_sub_samples)
+
+```
+
+
+### Graph the predicted mean probability and bounds
+
+
+```{r}
+
+# Smooth sequence of risk values
+newdata <- data.frame(
+  summed_risk_subset = seq(min(DAT_subset$summed_risk_subset), 
+                           max(DAT_subset$summed_risk_subset), 
+                           length.out = 50) ) %>%
+  
+  mutate(summed_risk_c = summed_risk_subset - mean(DAT_subset$summed_risk_subset))
+
+
+# Posterior predictions
+pdat <- apply(newdata, MARGIN = 1, FUN = function(x) {
+  linpred <- beta_binom_sub_samples[,1] + beta_binom_sub_samples[,2] * x["summed_risk_c"]
+  
+  # Back-transform to the probability scale
+  plogis(linpred)
+})
+
+
+```
+
+
+Summary statistics for predicted values: mean and 95% bounds.
+
+```{r}
+
+dat_stats <- apply(pdat, MARGIN = 2, FUN = function(probs) {
+  c(quantile(probs, 0.025),
+    mean(probs),
+    quantile(probs, 0.975) )
+})
+
+dat_stats <- t(dat_stats)
+colnames(dat_stats) <- c("lwr95", "fit", "upr95")
+
+dat_stats <- cbind(newdata, dat_stats)
+
+head(dat_stats)
+
+```
+
+
+Graph the predictions. 
+
+```{r}
+
+gg <- ggplot(data = dat_stats, aes(x = summed_risk_subset)) +
+  geom_ribbon(aes(ymin = lwr95, ymax = upr95), 
+              alpha = 0.2) +
+  
+  geom_line(aes(y = fit), size = 1, colour = "grey40") +
+
+  geom_point(data = DAT_subset, aes(y = nsites/TotalSites), size = 3) +
+  
+  scale_y_continuous(limits = c(0, NA)) +
+
+  labs(x = "Risk score", y = "Proportion of sites occupied")
+
+  
+ggsave(filename = "beta-binomial_subset_fit_unlabelled.png", plot = gg,
+       width = 20, height = 15, units = "cm")
+
+print(gg)  
+
+```
+
+Same graph with point labelled.
+
+```{r}
+
+gg <- gg +
+    geom_text_repel(data = DAT_subset, 
+                    aes(label = species_name, y = nsites/TotalSites), size = 3)
+
+
+ggsave(filename = "beta-binomial_subset_fit_labelled.png", plot = gg,
+       width = 20, height = 15, units = "cm")
+
+print(gg)  
+
+```
+
+### Model summary statistics 
+
+#### Probability that species occurrence is positively related to risk score
+
+We directly estimate this probability by calculation the proportion of posterior samples for parameter `b1` that are greater than zero.
+
+```{r}
+
+prop_b1_positive <- mean(beta_binom_sub_samples[, "b1"] > 0)
+
+cat("Probability that b1 is positive:", prop_b1_positive)
+
+```
+
+
+#### Proportion of deviance explained by the model
+
+First we calculate log-likelihood for the saturated (imaginary perfect) model. This is a model that fits the data perfectly, i.e. the predicted probability for each species is equal to the observed proportion of sites occupied in the training data. 
+
+```{r}
+
+# Perfect predictions
+prob_predicted_sat <- DAT_subset$nsites / TotalSites
+
+# The log-likelihood of the observed number of sites for each species 
+LL_sat <- dbinom(x = DAT_subset$nsites, 
+                 size = TotalSites, 
+                 prob = prob_predicted_sat,
+                 log = TRUE)
+
+# Total log-likelihood for the saturated model
+LL_sat <- sum(LL_sat)
+
+cat("Log-likelihood of saturated model:", LL_sat)
+
+```
+
+
+Next we calculate the likelihood values for a null (intercept-only) Beta-Binomial model. This allows for the possibility that the scale factor for over-dispersion could have a slightly different value to that arrived at by the full model. 
+
+```{r}
+
+null_model_code <- "model {
+  for (i in 1:length(nsites)) {
+    nsites[i] ~ dbin(p[i], TotalSites)
+    
+    p[i] ~ dbeta(a[i], b[i])
+    a[i] <- pmean * phi
+    b[i] <- (1 - pmean) * phi
+  }
+  
+  # Prior distributions for the intercept and the corresponding
+  # mean probability value (i.e. mean over all species)
+  b0 ~ dnorm(0, 0.01)
+  logit(pmean) <- b0
+
+  # Prior distribution for the phi scale parameter
+  phi ~ dexp(1/10)
+}"
+
+
+null_model <- run.jags(null_model_code, 
+                       data = list(
+                         nsites = DAT_subset$nsites,
+                         TotalSites = TotalSites
+                       ),
+                       monitor = c("b0", "phi"), 
+                       n.chains = 4,
+                       burnin = 10000,
+                       sample = 2000,
+                       thin = 5)
+
+```
+
+Get the model sample values for the intercept and `phi` parameters. For simplicity, we will just take the mean of the fitted `b0` and `phi` values to use for the calculation of the null model log-likelihood.
+
+```{r}
+
+null_model_samples <- as.matrix(null_model$mcmc)
+
+b0_mean <- mean(null_model_samples[, "b0"])
+phi <- mean(null_model_samples[, "phi"])
+
+# Fitted mean probability value (over all species)
+pmean <- plogis(b0_mean)
+
+# Beta distribution parameters that correspond to the pmean
+# and phi values
+a <- pmean * phi
+b <- (1 - pmean) * phi
+
+# Log-likelihood of each species observation
+LL_null <- extraDistr::dbbinom(DAT_subset$nsites, size = TotalSites, 
+                               alpha = a, beta = b, log = TRUE)
+
+# Total log-likelihood for the intercept-only model
+LL_null <- sum(LL_null)
+
+cat("Log-likelihood of the intercept-only (null) model:", LL_null)
+
+```
+
+Next, we calculate the log-likelihood for the fitted model. Once again we will use mean parameter values for simplicity.
+
+```{r}
+
+b0_mean <- mean(beta_binom_sub_samples[, "b0"])
+b1_mean <- mean(beta_binom_sub_samples[, "b1"])
+phi <- mean(beta_binom_sub_samples[, "phi"])
+
+# Fitted mean probability value for each species
+linpred <- b0_mean + b1_mean * DAT_subset$summed_risk_c  # using centred risk values
+pmean <- plogis(linpred)
+
+# Beta distribution parameters that correspond to the pmean
+# and phi values
+a <- pmean * phi
+b <- (1 - pmean) * phi
+
+# Log-likelihood of each species observation
+LL_betabinom_sub <- extraDistr::dbbinom(DAT_subset$nsites, size = TotalSites, 
+                                    alpha = a, beta = b, log = TRUE)
+
+# Total log-likelihood for the model
+LL_betabinom_sub <- sum(LL_betabinom_sub)
+
+cat("Log-likelihood of the fitted risk model:", LL_betabinom_sub)
+
+```
+
+
+Finally, we calculate the proportion of deviance explained.
+
+```{r}
+
+residual_deviance <- -2 * (LL_betabinom_sub - LL_sat)
+
+null_deviance <- -2 * (LL_null - LL_sat)
+
+percent_deviance_explained <- 100 * (1 - residual_deviance / null_deviance)
+
+cat("Percent deviance explained:", round(percent_deviance_explained, digits=2), "\n")
+
+```
+
+This compares to ~7% deviance explained for the original model.
+
+

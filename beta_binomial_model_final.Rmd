@@ -1,0 +1,609 @@
+---
+title: "Model of invasive grass species occurrence versus risk score"
+author: 
+  - Julia Rayment <jrayment@uow.edu.au>
+  - Michael Bedward <mbedward@uow.edu.au>
+output: 
+  word_document: 
+    fig_width: 8
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr, warn.conflicts = FALSE)
+library(janitor)
+library(stringr)
+library(readxl)
+library(tidyr)
+
+
+library(ggplot2)
+theme_set( theme_bw() )
+
+library(ggrepel)
+
+library(runjags)
+library(bayesplot)
+
+# Package used to help calculate log-likelihood and
+# deviance values for the fitted model
+library(extraDistr)
+
+runjags.options(method = "parallel", modules = "glm")
+
+# Set the pseudo-random number generator seed value
+# for reproducible results between sessions
+set.seed(42)
+
+```
+
+
+## Summary
+
+Code for the analyses of invasive grass species occurrence presented in Rayment et al (YEAR).
+
+
+## Data
+
+Total number of sites surveyed, including those with no EPGs detected.
+
+```{r}
+
+TotalSites <- 139
+
+```
+
+
+The risk assessment data are in an Excel file `EPG FINAL RANKING 2021.xlsx`. 
+
+```{r}
+
+DAT_EPG <- readxl::read_excel("EPG FINAL RANKING 2021.xlsx", sheet = 1, range = "B2:N31") %>%
+  
+  # standardize the column names for R
+  janitor::clean_names() %>%
+  
+  # rename the summed risk score column
+  rename(summed_risk = total_32)
+
+```
+
+
+The summary species occurrence data are in a CSV-format file `epg_overall_occurrence.csv`
+
+```{r}
+
+DAT_occurrence <- read.csv("epg_overall_occurrence.csv")
+
+# Calculate proportion of sites with presence
+DAT_occurrence <- DAT_occurrence %>%
+  mutate(psites = nsites / TotalSites)
+
+```
+
+
+Add summed risk score for each species and remove those without scores.
+
+```{r}
+
+DAT_occurrence <- DAT_occurrence %>%
+  # Match on name, or just genus for Sporobolus
+  mutate(match_name = ifelse(str_detect(species_name, "Sporobolus"), "Sporobolus", species_name)) %>%
+  
+  left_join(DAT_EPG %>% select(species_name, summed_risk), 
+            by = c("match_name" = "species_name")) %>%
+  
+  # Discard occurrence data for species that did not have a match
+  filter(!is.na(summed_risk)) %>%
+  
+  select(species_name, common_name, nsites, psites, summed_risk)
+
+
+head(DAT_occurrence)
+
+```
+
+
+### Summary graph
+
+Graph showing species occurrence (number of sites) versus summed risk score.
+
+```{r}
+
+ggplot(data = DAT_occurrence, aes(x = summed_risk, y = nsites)) +
+  geom_point(size = 2) +
+  
+  scale_y_continuous(name = "Number of sites", 
+                     limits = c(0, NA),
+                     sec.axis = sec_axis(
+                       trans = ~ . / TotalSites,
+                       name = "Proportion of sites")
+                    ) +
+  
+  labs(x = "Summed risk score")
+
+```
+
+
+### Assess over-dispersion relative to a Binomial distribution
+
+Here we fit a binomial GLM and calculate the dispersion ratio based on the Pearson residuals.
+
+```{r}
+
+Y <- DAT_occurrence %>%
+  select(present = nsites) %>%
+  mutate(absent = TotalSites - present) %>%
+  as.matrix()
+
+
+binom_glm <- glm(Y ~ summed_risk, data = DAT_occurrence, family = binomial(link = "logit"))
+
+rdf <- df.residual(binom_glm)
+rp <- residuals(binom_glm, type="pearson")
+ratio <- sum(rp^2)/rdf
+  
+cat("Over-dispersion ratio is", round(ratio, digits = 2))
+
+```
+
+
+## Beta-Binomial model for over-dispersed data
+
+A Beta-Binomial model accounts for over-dispersion, relative to a standard Binomial distribution, by allowing the observation-level probabilities to vary around a mean value (Bolker 2008, Harrison 2015).
+
+### Model structure
+
+The number of site occurrences for each species $y_i$ is treated as a Binomial variable, with a species-specific probability $p_i$:
+
+$$ y_i \sim \text{Binomial}(p_i, S) $$
+where $S$ is the total number of sites.
+
+The species probability of occurrence is drawn from a Beta distribution, with parameters related to a mean probability value $\bar{p_i}$ and a scale factor $\phi$ to account for over-dispersion.
+
+$$ p_i \sim \text{Beta}(a_i, b_i) $$
+$$ a_i = \phi \bar{p_i} $$
+
+$$ b_i = \phi(1 - \bar{p_i}) $$
+
+The mean probability is related to the risk score via a regression equation:
+
+$$ \text{logit}(\bar{p_i}) = \text{log}(\frac{\bar{p_i}}{1 - \bar{p_i}}) = \beta_0 + \beta_1X_i $$
+
+To complete the model, we define the following priors for the regression parameters and the $\phi$ scale parameter:
+
+$$ \beta_0, \beta_1 \sim \text{Normal}(0, 10) $$
+$$ \phi \sim \text{Exponential(1/10)} $$
+
+
+### JAGS model code 
+
+```{r}
+
+beta_binom_code <- "model {
+  # For each data record...
+  for (i in 1:length(nsites)) {
+    # The number of sites where the species occurs is treated as
+    # a binomial variable
+    #
+    nsites[i] ~ dbin(p[i], TotalSites)
+    
+    # The species probability of occurrence is drawn from a Beta
+    # distribution with parameters related to a mean probability
+    # value and a scale factor for over-dispersion
+    #
+    p[i] ~ dbeta(a[i], b[i])
+    a[i] <- pmean[i] * phi
+    b[i] <- (1 - pmean[i]) * phi
+    
+    # The mean probability is related to (centred) risk score
+    #
+    logit(pmean[i]) <- b0 + b1*summed_risk_c[i]
+  }
+
+  # Prior distributions for the regression parameters
+  # Note: that JAGS parameterizes a Normal distribution by precision 
+  # (1 / variance) rather than standard deviation.
+  b0 ~ dnorm(0, 0.01)
+  b1 ~ dnorm(0, 0.01)
+
+  # Prior distribution for the phi scale parameter
+  phi ~ dexp(1/10)
+}"
+
+```
+
+
+### Fit the model
+
+We centre the risk score values to improve MCMC convergence.
+
+```{r}
+
+DAT_occurrence <- DAT_occurrence %>%
+  mutate(summed_risk_c = summed_risk - mean(summed_risk))
+
+beta_binom_model <- run.jags(beta_binom_code, 
+                             data = list(
+                               nsites = DAT_occurrence$nsites,
+                               summed_risk_c = DAT_occurrence$summed_risk_c,
+                               TotalSites = TotalSites
+                             ),
+                             monitor = c("b0", "b1", "phi"), 
+                             n.chains = 4,
+                             burnin = 10000,
+                             sample = 2000,
+                             thin = 5)
+
+```
+
+
+```{r}
+
+summary(beta_binom_model)
+
+```
+
+All parameters have a sufficient number of effectively independent samples (SSeff) and Gelman-Rubin diagnostic values close to 1.0 (psrf) indicating that the MCMC chains have converged well.
+
+```{r}
+
+bayesplot::mcmc_combo(beta_binom_model$mcmc)
+
+```
+
+
+### Posterior samples from the fitted model
+
+```{r}
+
+beta_binom_samples <- as.matrix(beta_binom_model$mcmc)
+
+cat("Posterior samples matrix has", nrow(beta_binom_samples), "rows\n\n")
+
+head(beta_binom_samples)
+
+```
+
+
+### Graph the predicted mean probability and bounds
+
+
+```{r}
+
+# Smooth sequence of risk values
+newdata <- data.frame(
+  summed_risk = seq(min(DAT_occurrence$summed_risk), 
+                    max(DAT_occurrence$summed_risk), 
+                    length.out = 50) ) %>%
+  
+  mutate(summed_risk_c = summed_risk - mean(DAT_occurrence$summed_risk))
+
+
+
+
+# Posterior predictions
+pdat <- apply(newdata, MARGIN = 1, FUN = function(x) {
+  linpred <- beta_binom_samples[,1] + beta_binom_samples[,2] * x["summed_risk_c"]
+  
+  # Back-transform to the probability scale
+  plogis(linpred)
+})
+
+
+```
+
+
+Summary statistics for predicted values: mean and 95% bounds.
+
+```{r}
+
+dat_stats <- apply(pdat, MARGIN = 2, FUN = function(probs) {
+  c(quantile(probs, 0.025),
+    mean(probs),
+    quantile(probs, 0.975) )
+})
+
+dat_stats <- t(dat_stats)
+colnames(dat_stats) <- c("lwr95", "fit", "upr95")
+
+dat_stats <- cbind(newdata, dat_stats)
+
+head(dat_stats)
+
+```
+
+
+Graph the predictions. 
+
+```{r}
+
+gg <- ggplot(data = dat_stats, aes(x = summed_risk)) +
+  geom_ribbon(aes(ymin = lwr95, ymax = upr95), 
+              alpha = 0.2) +
+  
+  geom_line(aes(y = fit), size = 1, colour = "grey40") +
+
+  geom_point(data = DAT_occurrence, aes(y = psites), size = 3) +
+  
+  scale_y_continuous(limits = c(0, NA)) +
+
+  labs(x = "Risk score", y = "Proportion of sites occupied")
+
+  
+ggsave(filename = "beta-binomial_fit_unlabelled.png", plot = gg,
+       width = 20, height = 15, units = "cm")
+
+print(gg)  
+
+```
+
+Same graph with point labelled.
+
+```{r}
+
+gg <- gg +
+    geom_text_repel(data = DAT_occurrence, aes(y = psites, label = species_name), size = 3)
+
+
+ggsave(filename = "beta-binomial_fit_labelled.png", plot = gg,
+       width = 20, height = 15, units = "cm")
+
+print(gg)  
+
+```
+
+### Model summary statistics 
+
+#### Probability that species occurrence is positively related to risk score
+
+We directly estimate this probability by calculation the proportion of posterior samples for parameter `b1` that are greater than zero.
+
+```{r}
+
+prop_b1_positive <- mean(beta_binom_samples[, "b1"] > 0)
+
+cat("Probability that b1 is positive:", prop_b1_positive)
+
+```
+
+#### Proportion of deviance explained by the model
+
+First we calculate log-likelihood for the saturated (imaginary perfect) model. This is a model that fits the data perfectly, i.e. the predicted probability for each species is equal to the observed proportion of sites occupied in the training data. 
+
+```{r}
+
+# Perfect predictions
+prob_predicted_sat <- DAT_occurrence$nsites / TotalSites
+
+# The log-likelihood of the observed number of sites for each species 
+LL_sat <- dbinom(x = DAT_occurrence$nsites, 
+                 size = TotalSites, 
+                 prob = prob_predicted_sat,
+                 log = TRUE)
+
+# Total log-likelihood for the saturated model
+LL_sat <- sum(LL_sat)
+
+cat("Log-likelihood of saturated model:", LL_sat)
+
+```
+
+
+Next we calculate the likelihood values for a null (intercept-only) Beta-Binomial model. This allows for the possibility that the scale factor for over-dispersion could have a slightly different value to that arrived at by the full model. 
+
+```{r}
+
+null_model_code <- "model {
+  for (i in 1:length(nsites)) {
+    nsites[i] ~ dbin(p[i], TotalSites)
+    
+    p[i] ~ dbeta(a[i], b[i])
+    a[i] <- pmean * phi
+    b[i] <- (1 - pmean) * phi
+  }
+  
+  # Prior distributions for the intercept and the corresponding
+  # mean probability value (i.e. mean over all species)
+  b0 ~ dnorm(0, 0.01)
+  logit(pmean) <- b0
+
+  # Prior distribution for the phi scale parameter
+  phi ~ dexp(1/10)
+}"
+
+
+null_model <- run.jags(null_model_code, 
+                       data = list(
+                         nsites = DAT_occurrence$nsites,
+                         TotalSites = TotalSites
+                       ),
+                       monitor = c("b0", "phi"), 
+                       n.chains = 4,
+                       burnin = 10000,
+                       sample = 2000,
+                       thin = 5)
+
+```
+
+Get the model sample values for the intercept and `phi` parameters. For simplicity, we will just take the mean of the fitted `b0` and `phi` values to use for the calculation of the null model log-likelihood.
+
+```{r}
+
+null_model_samples <- as.matrix(null_model$mcmc)
+
+b0_mean <- mean(null_model_samples[, "b0"])
+phi <- mean(null_model_samples[, "phi"])
+
+# Fitted mean probability value (over all species)
+pmean <- plogis(b0_mean)
+
+# Beta distribution parameters that correspond to the pmean
+# and phi values
+a <- pmean * phi
+b <- (1 - pmean) * phi
+
+# Log-likelihood of each species observation
+LL_null <- extraDistr::dbbinom(DAT_occurrence$nsites, size = TotalSites, 
+                               alpha = a, beta = b, log = TRUE)
+
+# Total log-likelihood for the intercept-only model
+LL_null <- sum(LL_null)
+
+cat("Log-likelihood of the intercept-only (null) model:", LL_null)
+
+```
+
+Next, we calculate the log-likelihood for the fitted model. Once again we will use mean parameter values for simplicity.
+
+```{r}
+
+b0_mean <- mean(beta_binom_samples[, "b0"])
+b1_mean <- mean(beta_binom_samples[, "b1"])
+phi <- mean(beta_binom_samples[, "phi"])
+
+# Fitted mean probability value for each species
+linpred <- b0_mean + b1_mean * DAT_occurrence$summed_risk_c  # using centred risk values
+pmean <- plogis(linpred)
+
+# Beta distribution parameters that correspond to the pmean
+# and phi values
+a <- pmean * phi
+b <- (1 - pmean) * phi
+
+# Log-likelihood of each species observation
+LL_betabinom <- extraDistr::dbbinom(DAT_occurrence$nsites, size = TotalSites, 
+                                    alpha = a, beta = b, log = TRUE)
+
+# Total log-likelihood for the model
+LL_betabinom <- sum(LL_betabinom)
+
+cat("Log-likelihood of the fitted risk model:", LL_betabinom)
+
+```
+
+
+Finally, we calculate the proportion of deviance explained.
+
+```{r}
+
+residual_deviance <- -2 * (LL_betabinom - LL_sat)
+
+null_deviance <- -2 * (LL_null - LL_sat)
+
+percent_deviance_explained <- 100 * (1 - residual_deviance / null_deviance)
+
+cat("Percent deviance explained:", round(percent_deviance_explained, digits=2), "\n")
+
+```
+
+
+#### Strength of effect
+
+To help to understand the strength of the effect, and the utility of the risk score for prediction, we contrast predicted probability of occurrence for three species at the low, middle and high end of risk score.
+
+```{r}
+
+dat_contrasts <- DAT_occurrence %>%
+  filter(species_name %in% c("Bromus catharticus", "Ehrharta erecta", "Eragrostis curvula")) %>%
+  arrange(summed_risk) %>%
+  mutate(label = c("low", "mid", "high"))
+
+```
+
+Predict the mean probability of occurrence for each species, then calculate predicted pair-wise differences.
+
+```{r}
+
+# Create a matrix where each column has the indices for a pair of values
+# to use for calculation of a difference
+pairwise_indices <- combn(1:3, 2)
+
+pairwise_indices
+
+```
+
+
+```{r}
+
+pairwise_labels <- paste0(dat_contrasts$label[ pairwise_indices[2,] ],
+                          "-",
+                          dat_contrasts$label[ pairwise_indices[1,] ])
+
+pairwise_labels
+
+```
+
+
+```{r}
+
+pdat <- apply(beta_binom_samples, MARGIN = 1, FUN = function(params) {
+  # Calculate linear predictor values
+  linpred <- params["b0"] + params["b1"] * dat_contrasts$summed_risk
+  
+  # Transform to the probability scale
+  p <- plogis(linpred)
+  
+  pdiffs <- p[pairwise_indices[2,]] - p[pairwise_indices[1,]]
+  
+  # Return probabilities and pairwise differences
+  c(p, pdiffs)
+})
+
+# pdat will have 6 rows (3 probabilities + 3 pairwise differences) and N columns
+# where N is the number of MCMC samples from the fitted model.
+# Transpose it to have N rows and 6 columns.
+pdat <- t(pdat)
+colnames(pdat) <- c(paste0("p", dat_contrasts$label), pairwise_labels)
+
+head(pdat)
+
+```
+
+Graph the distribution of each pairwise difference.
+
+```{r}
+
+dat.gg <- pdat[, pairwise_labels] %>%
+  as.data.frame() %>%
+  
+  # convert to long-format for plotting
+  tidyr::pivot_longer(everything(), names_to = "Contrast")
+
+
+ggplot(data = dat.gg) +
+  geom_density(aes(x = value, fill = Contrast, colour = Contrast), alpha = 0.2) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  
+  labs(x = "Difference in probability",
+       title = "Predicted differences in probability of occurrence for contrasting risk scores")
+
+```
+
+Summary statistics for pairwise differences.
+
+```{r}
+
+percent_differences <- dat.gg %>%
+  group_by(Contrast) %>%
+  
+  # Median, 50% and 90% bounds
+  summarize(
+    lower95 = quantile(value, 0.025),
+    lower50 = quantile(value, 0.25),
+    median = median(value),
+    upper50 = quantile(value, 0.75),
+    upper95 = quantile(value, 0.975)
+  ) %>%
+  
+  # express differences as percentages
+  mutate(across(!Contrast, ~ round(.x * 100, digits = 2)))
+  
+
+percent_differences
+
+```
+
